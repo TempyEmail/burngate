@@ -3,6 +3,9 @@ use std::net::IpAddr;
 
 use tokio::sync::Mutex;
 
+/// Number of entries before triggering stale-entry eviction.
+const CLEANUP_THRESHOLD: usize = 10_000;
+
 /// Per-IP connection tracking with a sliding window.
 pub struct IpRateLimiter {
     map: Mutex<HashMap<IpAddr, (u32, tokio::time::Instant)>>,
@@ -23,6 +26,13 @@ impl IpRateLimiter {
     pub async fn check_and_increment(&self, ip: IpAddr) -> bool {
         let now = tokio::time::Instant::now();
         let mut map = self.map.lock().await;
+
+        // Evict stale entries when the map grows too large
+        if map.len() > CLEANUP_THRESHOLD {
+            let window = self.window;
+            map.retain(|_, (_, last_seen)| now.duration_since(*last_seen) < window);
+        }
+
         let entry = map.entry(ip).or_insert((0, now));
         // Reset window if expired
         if now.duration_since(entry.1) >= self.window {

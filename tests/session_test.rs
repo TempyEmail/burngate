@@ -7,63 +7,63 @@ use burngate::session::{extract_address, is_domain_accepted, parse_command};
 #[test]
 fn parse_command_ehlo() {
     let (cmd, args) = parse_command("EHLO mail.example.com");
-    assert_eq!(cmd, "EHLO");
+    assert_eq!(cmd.as_str(), "EHLO");
     assert_eq!(args, "mail.example.com");
 }
 
 #[test]
 fn parse_command_no_args() {
     let (cmd, args) = parse_command("QUIT");
-    assert_eq!(cmd, "QUIT");
+    assert_eq!(cmd.as_str(), "QUIT");
     assert_eq!(args, "");
 }
 
 #[test]
 fn parse_command_with_trailing_whitespace() {
     let (cmd, args) = parse_command("  NOOP  ");
-    assert_eq!(cmd, "NOOP");
+    assert_eq!(cmd.as_str(), "NOOP");
     assert_eq!(args, "");
 }
 
 #[test]
 fn parse_command_rcpt_to() {
     let (cmd, args) = parse_command("RCPT TO:<user@example.com>");
-    assert_eq!(cmd, "RCPT");
+    assert_eq!(cmd.as_str(), "RCPT");
     assert_eq!(args, "TO:<user@example.com>");
 }
 
 #[test]
 fn parse_command_mail_from() {
     let (cmd, args) = parse_command("MAIL FROM:<sender@example.com> SIZE=1024");
-    assert_eq!(cmd, "MAIL");
+    assert_eq!(cmd.as_str(), "MAIL");
     assert_eq!(args, "FROM:<sender@example.com> SIZE=1024");
 }
 
 #[test]
 fn parse_command_empty() {
     let (cmd, args) = parse_command("");
-    assert_eq!(cmd, "");
+    assert_eq!(cmd.as_str(), "");
     assert_eq!(args, "");
 }
 
 #[test]
 fn parse_command_multiple_spaces() {
     let (cmd, args) = parse_command("EHLO   mail.example.com");
-    assert_eq!(cmd, "EHLO");
+    assert_eq!(cmd.as_str(), "EHLO");
     assert_eq!(args, "mail.example.com");
 }
 
 #[test]
 fn parse_command_case_insensitive() {
     let (cmd, args) = parse_command("ehlo mail.example.com");
-    assert_eq!(cmd, "EHLO");
+    assert_eq!(cmd.as_str(), "EHLO");
     assert_eq!(args, "mail.example.com");
 }
 
 #[test]
 fn parse_command_mixed_case() {
     let (cmd, args) = parse_command("Rcpt TO:<user@example.com>");
-    assert_eq!(cmd, "RCPT");
+    assert_eq!(cmd.as_str(), "RCPT");
     assert_eq!(args, "TO:<user@example.com>");
 }
 

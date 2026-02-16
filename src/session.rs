@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use arrayvec::ArrayString;
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -60,6 +61,16 @@ impl SessionState {
     }
 }
 
+/// Immutable context shared across the SMTP command loop.
+struct SmtpContext<'a> {
+    peer_addr: std::net::SocketAddr,
+    config: &'a Config,
+    lookup: &'a MailboxLookup,
+    tls_config: &'a Option<TlsConfig>,
+    metrics: &'a Metrics,
+    tls_active: bool,
+}
+
 /// Handle a single SMTP session.
 pub async fn handle_session(
     stream: tokio::net::TcpStream,
@@ -113,17 +124,15 @@ async fn run_session(
     .await?;
 
     // Run SMTP loop on plain connection
-    let result = smtp_loop(
-        &mut reader,
-        &mut state,
+    let ctx = SmtpContext {
         peer_addr,
-        &config,
-        &lookup,
-        &tls_config,
-        &metrics,
-        false,
-    )
-    .await;
+        config: &config,
+        lookup: &lookup,
+        tls_config: &tls_config,
+        metrics: &metrics,
+        tls_active: false,
+    };
+    let result = smtp_loop(&mut reader, &mut state, &ctx).await;
 
     match result {
         LoopResult::Done(r) => r,
@@ -142,17 +151,15 @@ async fn run_session(
             let mut tls_reader = BufReader::new(tls_stream);
 
             // Continue SMTP on the TLS connection
-            let result = smtp_loop(
-                &mut tls_reader,
-                &mut state,
+            let ctx = SmtpContext {
                 peer_addr,
-                &config,
-                &lookup,
-                &tls_config,
-                &metrics,
-                true,
-            )
-            .await;
+                config: &config,
+                lookup: &lookup,
+                tls_config: &tls_config,
+                metrics: &metrics,
+                tls_active: true,
+            };
+            let result = smtp_loop(&mut tls_reader, &mut state, &ctx).await;
 
             match result {
                 LoopResult::Done(r) => r,
@@ -181,7 +188,20 @@ async fn send_line<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Send an SMTP response line, returning from the loop on write error.
+macro_rules! send_or_return {
+    ($reader:expr, $line:expr) => {
+        if let Err(e) = send_line($reader.get_mut(), $line).await {
+            return LoopResult::Done(Err(e.into()));
+        }
+    };
+}
+
 /// Read a single line from the SMTP client with a hard byte limit.
+///
+/// Reads in buffered chunks via `fill_buf()`/`consume()` instead of
+/// byte-by-byte, avoiding per-byte overhead while still enforcing the
+/// size limit.
 ///
 /// Returns an error if the line exceeds `max_len` bytes before a newline is
 /// found. This prevents memory exhaustion from newline-less input.
@@ -192,23 +212,34 @@ async fn read_line<R: tokio::io::AsyncRead + Unpin>(
 ) -> Result<Option<String>, std::io::Error> {
     buf.clear();
     loop {
-        let byte = match reader.read_u8().await {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                if buf.is_empty() {
-                    return Ok(None);
-                }
-                // Return what we have
-                let s = String::from_utf8_lossy(buf).trim_end().to_string();
-                return Ok(Some(s));
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            // EOF
+            if buf.is_empty() {
+                return Ok(None);
             }
-            Err(e) => return Err(e),
-        };
-        if byte == b'\n' {
             let s = String::from_utf8_lossy(buf).trim_end().to_string();
             return Ok(Some(s));
         }
-        buf.push(byte);
+
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            // Found newline — take everything before it, consume through the \n
+            buf.extend_from_slice(&available[..pos]);
+            reader.consume(pos + 1);
+            if buf.len() > max_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "line exceeds maximum length",
+                ));
+            }
+            let s = String::from_utf8_lossy(buf).trim_end().to_string();
+            return Ok(Some(s));
+        }
+
+        // No newline in this chunk — consume it all and keep reading
+        let len = available.len();
+        buf.extend_from_slice(available);
+        reader.consume(len);
         if buf.len() > max_len {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -269,25 +300,19 @@ async fn read_data<R: tokio::io::AsyncRead + Unpin>(
 ///
 /// Uses `BufReader<S>` where S implements both AsyncRead and AsyncWrite.
 /// Writes go through `reader.get_mut()` since SMTP is half-duplex.
-#[allow(clippy::too_many_arguments)]
 async fn smtp_loop<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     reader: &mut BufReader<S>,
     state: &mut SessionState,
-    peer_addr: std::net::SocketAddr,
-    config: &Config,
-    lookup: &MailboxLookup,
-    tls_config: &Option<TlsConfig>,
-    metrics: &Metrics,
-    tls_active: bool,
+    ctx: &SmtpContext<'_>,
 ) -> LoopResult {
     let mut line_buf = Vec::with_capacity(1024);
 
     loop {
-        let line = match read_line(reader, &mut line_buf, config.max_line_length).await {
+        let line = match read_line(reader, &mut line_buf, ctx.config.max_line_length).await {
             Ok(Some(line)) => line,
             Ok(None) => return LoopResult::Done(Ok(())),
             Err(e) => {
-                debug!(peer = %peer_addr, error = %e, "read error");
+                debug!(peer = %ctx.peer_addr, error = %e, "read error");
                 return LoopResult::Done(Ok(()));
             }
         };
@@ -298,151 +323,111 @@ async fn smtp_loop<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
             "EHLO" | "HELO" => {
                 state.ehlo_received = true;
                 let mut caps = vec![
-                    format!("250-{} Hello {}", config.server_name, args),
+                    format!("250-{} Hello {}", ctx.config.server_name, args),
                     "250-SIZE 10485760".to_string(),
                     "250-8BITMIME".to_string(),
                     "250-PIPELINING".to_string(),
                     "250-ENHANCEDSTATUSCODES".to_string(),
                 ];
-                if tls_config.is_some() && !tls_active {
+                if ctx.tls_config.is_some() && !ctx.tls_active {
                     caps.push("250-STARTTLS".to_string());
                 }
                 if let Some(last) = caps.last_mut() {
                     *last = last.replacen("250-", "250 ", 1);
                 }
                 for cap in &caps {
-                    if let Err(e) = send_line(reader.get_mut(), cap).await {
-                        return LoopResult::Done(Err(e.into()));
-                    }
+                    send_or_return!(reader, cap);
                 }
             }
 
             "STARTTLS" => {
-                if tls_active {
-                    if let Err(e) =
-                        send_line(reader.get_mut(), "554 5.5.1 TLS already active").await
-                    {
-                        return LoopResult::Done(Err(e.into()));
-                    }
-                } else if tls_config.is_some() {
-                    if let Err(e) =
-                        send_line(reader.get_mut(), "220 2.0.0 Ready to start TLS").await
-                    {
-                        return LoopResult::Done(Err(e.into()));
-                    }
+                if ctx.tls_active {
+                    send_or_return!(reader, "554 5.5.1 TLS already active");
+                } else if ctx.tls_config.is_some() {
+                    send_or_return!(reader, "220 2.0.0 Ready to start TLS");
                     return LoopResult::StartTls;
-                } else if let Err(e) =
-                    send_line(reader.get_mut(), "502 5.5.1 STARTTLS not available").await
-                {
-                    return LoopResult::Done(Err(e.into()));
+                } else {
+                    send_or_return!(reader, "502 5.5.1 STARTTLS not available");
                 }
             }
 
             "MAIL" => {
                 state.sender = extract_address(args);
                 state.recipients.clear();
-                if let Err(e) = send_line(reader.get_mut(), "250 2.1.0 OK").await {
-                    return LoopResult::Done(Err(e.into()));
-                }
+                send_or_return!(reader, "250 2.1.0 OK");
             }
 
             "RCPT" => {
                 let address = match extract_address(args) {
                     Some(addr) => addr,
                     None => {
-                        if let Err(e) =
-                            send_line(reader.get_mut(), "501 5.1.3 Bad recipient address syntax")
-                                .await
-                        {
-                            return LoopResult::Done(Err(e.into()));
-                        }
+                        send_or_return!(reader, "501 5.1.3 Bad recipient address syntax");
                         continue;
                     }
                 };
 
                 // Enforce per-session RCPT TO limit
                 state.recipient_count += 1;
-                if state.recipient_count > config.max_recipients {
+                if state.recipient_count > ctx.config.max_recipients {
                     warn!(
-                        peer = %peer_addr,
+                        peer = %ctx.peer_addr,
                         count = state.recipient_count,
-                        max = config.max_recipients,
+                        max = ctx.config.max_recipients,
                         "RCPT TO limit exceeded"
                     );
-                    if let Err(e) =
-                        send_line(reader.get_mut(), "452 4.5.3 Too many recipients").await
-                    {
-                        return LoopResult::Done(Err(e.into()));
-                    }
+                    send_or_return!(reader, "452 4.5.3 Too many recipients");
                     continue;
                 }
 
                 let address_lower = address.to_lowercase();
                 let domain = address_lower.rsplit('@').next().unwrap_or("");
 
-                if !is_domain_accepted(domain, &config.accepted_domains) {
+                if !is_domain_accepted(domain, &ctx.config.accepted_domains) {
                     info!(
-                        peer = %peer_addr,
+                        peer = %ctx.peer_addr,
                         address = %address_lower,
                         domain = domain,
                         "[MAIL-REJECTED] unknown domain"
                     );
-                    metrics.rejected.fetch_add(1, Ordering::Relaxed);
-                    if let Err(e) = send_line(reader.get_mut(), "550 5.1.2 Unknown domain").await {
-                        return LoopResult::Done(Err(e.into()));
-                    }
+                    ctx.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+                    send_or_return!(reader, "550 5.1.2 Unknown domain");
                     continue;
                 }
 
                 // Check Redis for mailbox existence — the key spam-filtering step
-                if !lookup.should_accept(&address_lower).await {
+                if !ctx.lookup.should_accept(&address_lower).await {
                     info!(
-                        peer = %peer_addr,
+                        peer = %ctx.peer_addr,
                         address = %address_lower,
                         "[MAIL-REJECTED] mailbox not found"
                     );
-                    metrics.rejected.fetch_add(1, Ordering::Relaxed);
-                    if let Err(e) = send_line(reader.get_mut(), "550 5.1.1 User unknown").await {
-                        return LoopResult::Done(Err(e.into()));
-                    }
+                    ctx.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+                    send_or_return!(reader, "550 5.1.1 User unknown");
                     continue;
                 }
 
                 info!(
-                    peer = %peer_addr,
+                    peer = %ctx.peer_addr,
                     address = %address_lower,
                     "[RCPT-ACCEPTED] mailbox verified"
                 );
                 state.recipients.insert(address_lower);
-                if let Err(e) = send_line(reader.get_mut(), "250 2.1.5 OK").await {
-                    return LoopResult::Done(Err(e.into()));
-                }
+                send_or_return!(reader, "250 2.1.5 OK");
             }
 
             "DATA" => {
                 if state.recipients.is_empty() {
-                    if let Err(e) =
-                        send_line(reader.get_mut(), "503 5.5.1 No valid recipients").await
-                    {
-                        return LoopResult::Done(Err(e.into()));
-                    }
+                    send_or_return!(reader, "503 5.5.1 No valid recipients");
                     continue;
                 }
 
-                if let Err(e) = send_line(
-                    reader.get_mut(),
-                    "354 Start mail input; end with <CRLF>.<CRLF>",
-                )
-                .await
-                {
-                    return LoopResult::Done(Err(e.into()));
-                }
+                send_or_return!(reader, "354 Start mail input; end with <CRLF>.<CRLF>");
 
-                let data = match read_data(reader, config.max_message_size).await {
+                let data = match read_data(reader, ctx.config.max_message_size).await {
                     Ok(data) => data,
                     Err(e) => {
                         let _ = send_line(reader.get_mut(), "552 5.3.4 Message too large").await;
-                        debug!(peer = %peer_addr, error = %e, "data read error");
+                        debug!(peer = %ctx.peer_addr, error = %e, "data read error");
                         continue;
                     }
                 };
@@ -450,39 +435,33 @@ async fn smtp_loop<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                 let sender = state.sender.as_deref().unwrap_or("");
                 let recipients: Vec<String> = state.recipients.iter().cloned().collect();
 
-                match relay::relay_message(&config.backend_addr, sender, &recipients, &data).await {
+                match relay::relay_message(&ctx.config.backend_addr, sender, &recipients, &data)
+                    .await
+                {
                     Ok(()) => {
-                        metrics
+                        ctx.metrics
                             .accepted
                             .fetch_add(recipients.len() as u64, Ordering::Relaxed);
                         info!(
-                            peer = %peer_addr,
+                            peer = %ctx.peer_addr,
                             sender = sender,
                             recipients = ?recipients,
                             size = data.len(),
                             "[MAIL-RELAYED] forwarded to backend"
                         );
-                        if let Err(e) =
-                            send_line(reader.get_mut(), "250 2.0.0 OK message accepted").await
-                        {
-                            return LoopResult::Done(Err(e.into()));
-                        }
+                        send_or_return!(reader, "250 2.0.0 OK message accepted");
                     }
                     Err(e) => {
-                        metrics.relay_errors.fetch_add(1, Ordering::Relaxed);
+                        ctx.metrics.relay_errors.fetch_add(1, Ordering::Relaxed);
                         warn!(
-                            peer = %peer_addr,
+                            peer = %ctx.peer_addr,
                             error = %e,
                             "[RELAY-ERROR] failed to forward to backend"
                         );
-                        if let Err(e) = send_line(
-                            reader.get_mut(),
-                            "451 4.3.0 Temporary relay failure, try again later",
-                        )
-                        .await
-                        {
-                            return LoopResult::Done(Err(e.into()));
-                        }
+                        send_or_return!(
+                            reader,
+                            "451 4.3.0 Temporary relay failure, try again later"
+                        );
                     }
                 }
 
@@ -491,15 +470,11 @@ async fn smtp_loop<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
 
             "RSET" => {
                 state.reset_transaction();
-                if let Err(e) = send_line(reader.get_mut(), "250 2.0.0 OK").await {
-                    return LoopResult::Done(Err(e.into()));
-                }
+                send_or_return!(reader, "250 2.0.0 OK");
             }
 
             "NOOP" => {
-                if let Err(e) = send_line(reader.get_mut(), "250 2.0.0 OK").await {
-                    return LoopResult::Done(Err(e.into()));
-                }
+                send_or_return!(reader, "250 2.0.0 OK");
             }
 
             "QUIT" => {
@@ -508,19 +483,13 @@ async fn smtp_loop<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
             }
 
             "VRFY" => {
-                if let Err(e) = send_line(reader.get_mut(), "252 2.5.2 Cannot verify user").await {
-                    return LoopResult::Done(Err(e.into()));
-                }
+                send_or_return!(reader, "252 2.5.2 Cannot verify user");
             }
 
             "" => {}
 
             _ => {
-                if let Err(e) =
-                    send_line(reader.get_mut(), "502 5.5.2 Command not recognized").await
-                {
-                    return LoopResult::Done(Err(e.into()));
-                }
+                send_or_return!(reader, "502 5.5.2 Command not recognized");
             }
         }
     }
@@ -539,14 +508,24 @@ pub fn is_domain_accepted(domain: &str, accepted: &std::collections::HashSet<Str
 
 /// Parse the first word (command) and the rest (arguments) from an SMTP line.
 /// The command is uppercased for case-insensitive matching per RFC 5321.
-pub fn parse_command(line: &str) -> (String, &str) {
+/// Uses a stack-allocated `ArrayString<8>` since SMTP commands are at most 8 bytes.
+pub fn parse_command(line: &str) -> (ArrayString<8>, &str) {
     let trimmed = line.trim();
     match trimmed.find(' ') {
         Some(pos) => {
-            let cmd = trimmed[..pos].to_ascii_uppercase();
+            let mut cmd = ArrayString::<8>::new();
+            for ch in trimmed[..pos].chars().take(8) {
+                let _ = cmd.try_push(ch.to_ascii_uppercase());
+            }
             (cmd, trimmed[pos + 1..].trim())
         }
-        None => (trimmed.to_ascii_uppercase(), ""),
+        None => {
+            let mut cmd = ArrayString::<8>::new();
+            for ch in trimmed.chars().take(8) {
+                let _ = cmd.try_push(ch.to_ascii_uppercase());
+            }
+            (cmd, "")
+        }
     }
 }
 
