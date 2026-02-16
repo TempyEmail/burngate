@@ -560,3 +560,176 @@ pub fn extract_address(args: &str) -> Option<String> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::BufReader;
+
+    // -- read_line (bounded) --
+
+    #[tokio::test]
+    async fn read_line_normal() {
+        let input = b"EHLO example.com\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let result = read_line(&mut reader, &mut buf, 1024).await.unwrap();
+        assert_eq!(result, Some("EHLO example.com".to_string()));
+    }
+
+    #[tokio::test]
+    async fn read_line_lf_only() {
+        let input = b"QUIT\n";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let result = read_line(&mut reader, &mut buf, 1024).await.unwrap();
+        assert_eq!(result, Some("QUIT".to_string()));
+    }
+
+    #[tokio::test]
+    async fn read_line_eof_empty() {
+        let input = b"";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let result = read_line(&mut reader, &mut buf, 1024).await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn read_line_eof_with_partial_data() {
+        let input = b"PARTIAL";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let result = read_line(&mut reader, &mut buf, 1024).await.unwrap();
+        assert_eq!(result, Some("PARTIAL".to_string()));
+    }
+
+    #[tokio::test]
+    async fn read_line_exceeds_limit() {
+        // 10 bytes of 'A' without a newline, limit of 5
+        let input = b"AAAAAAAAAA";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let result = read_line(&mut reader, &mut buf, 5).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_line_exactly_at_limit() {
+        // 5 bytes + newline, limit of 5 — should succeed
+        let input = b"ABCDE\n";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let result = read_line(&mut reader, &mut buf, 5).await.unwrap();
+        assert_eq!(result, Some("ABCDE".to_string()));
+    }
+
+    #[tokio::test]
+    async fn read_line_one_over_limit() {
+        // 6 bytes without newline, limit of 5 — should fail
+        let input = b"ABCDEF\n";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let result = read_line(&mut reader, &mut buf, 5).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_line_multiple_lines() {
+        let input = b"LINE1\r\nLINE2\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+
+        let r1 = read_line(&mut reader, &mut buf, 1024).await.unwrap();
+        assert_eq!(r1, Some("LINE1".to_string()));
+
+        let r2 = read_line(&mut reader, &mut buf, 1024).await.unwrap();
+        assert_eq!(r2, Some("LINE2".to_string()));
+
+        let r3 = read_line(&mut reader, &mut buf, 1024).await.unwrap();
+        assert_eq!(r3, None);
+    }
+
+    // -- read_data (no dot-unstuffing, raw wire format) --
+
+    #[tokio::test]
+    async fn read_data_simple_message() {
+        let input = b"Subject: test\r\n\r\nHello world\r\n.\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let data = read_data(&mut reader, 10_000).await.unwrap();
+        assert_eq!(data, b"Subject: test\r\n\r\nHello world\r\n");
+    }
+
+    #[tokio::test]
+    async fn read_data_preserves_dot_stuffing() {
+        // ".." lines should be passed through raw (no unstuffing)
+        let input = b"..leading dot\r\n.\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let data = read_data(&mut reader, 10_000).await.unwrap();
+        // Raw wire format: the ".." is preserved
+        assert_eq!(data, b"..leading dot\r\n");
+    }
+
+    #[tokio::test]
+    async fn read_data_dot_only_terminates() {
+        let input = b"line1\r\n.\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let data = read_data(&mut reader, 10_000).await.unwrap();
+        assert_eq!(data, b"line1\r\n");
+    }
+
+    #[tokio::test]
+    async fn read_data_dot_lf_terminates() {
+        // Lone "." with just LF (no CR)
+        let input = b"line1\n.\n";
+        let mut reader = BufReader::new(&input[..]);
+        let data = read_data(&mut reader, 10_000).await.unwrap();
+        assert_eq!(data, b"line1\n");
+    }
+
+    #[tokio::test]
+    async fn read_data_exceeds_max_size() {
+        // 100 bytes of data, max_size of 10
+        let mut input = Vec::new();
+        for _ in 0..20 {
+            input.extend_from_slice(b"AAAAA\r\n");
+        }
+        input.extend_from_slice(b".\r\n");
+        let mut reader = BufReader::new(&input[..]);
+        let result = read_data(&mut reader, 10).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_data_eof_before_terminator() {
+        let input = b"line1\r\nline2\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let result = read_data(&mut reader, 10_000).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[tokio::test]
+    async fn read_data_empty_message() {
+        // Just a terminator, no body
+        let input = b".\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let data = read_data(&mut reader, 10_000).await.unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_data_dot_in_middle_of_line_not_terminator() {
+        // A line with "." in it but not alone
+        let input = b".not-a-terminator\r\n.\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let data = read_data(&mut reader, 10_000).await.unwrap();
+        // ".not-a-terminator" is not a lone ".", so it's included in data
+        assert_eq!(data, b".not-a-terminator\r\n");
+    }
+}
