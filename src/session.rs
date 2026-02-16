@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use arrayvec::ArrayString;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::{debug, info, warn};
 
@@ -40,6 +41,8 @@ struct SessionState {
     sender: Option<String>,
     recipients: HashSet<String>,
     ehlo_received: bool,
+    /// Running count of RCPT TO commands in this session (not reset per transaction).
+    recipient_count: usize,
 }
 
 impl SessionState {
@@ -48,6 +51,7 @@ impl SessionState {
             sender: None,
             recipients: HashSet::new(),
             ehlo_received: false,
+            recipient_count: 0,
         }
     }
 
@@ -55,6 +59,16 @@ impl SessionState {
         self.sender = None;
         self.recipients.clear();
     }
+}
+
+/// Immutable context shared across the SMTP command loop.
+struct SmtpContext<'a> {
+    peer_addr: std::net::SocketAddr,
+    config: &'a Config,
+    lookup: &'a MailboxLookup,
+    tls_config: &'a Option<TlsConfig>,
+    metrics: &'a Metrics,
+    tls_active: bool,
 }
 
 /// Handle a single SMTP session.
@@ -110,17 +124,15 @@ async fn run_session(
     .await?;
 
     // Run SMTP loop on plain connection
-    let result = smtp_loop(
-        &mut reader,
-        &mut state,
+    let ctx = SmtpContext {
         peer_addr,
-        &config,
-        &lookup,
-        &tls_config,
-        &metrics,
-        false,
-    )
-    .await;
+        config: &config,
+        lookup: &lookup,
+        tls_config: &tls_config,
+        metrics: &metrics,
+        tls_active: false,
+    };
+    let result = smtp_loop(&mut reader, &mut state, &ctx).await;
 
     match result {
         LoopResult::Done(r) => r,
@@ -139,17 +151,15 @@ async fn run_session(
             let mut tls_reader = BufReader::new(tls_stream);
 
             // Continue SMTP on the TLS connection
-            let result = smtp_loop(
-                &mut tls_reader,
-                &mut state,
+            let ctx = SmtpContext {
                 peer_addr,
-                &config,
-                &lookup,
-                &tls_config,
-                &metrics,
-                true,
-            )
-            .await;
+                config: &config,
+                lookup: &lookup,
+                tls_config: &tls_config,
+                metrics: &metrics,
+                tls_active: true,
+            };
+            let result = smtp_loop(&mut tls_reader, &mut state, &ctx).await;
 
             match result {
                 LoopResult::Done(r) => r,
@@ -178,33 +188,81 @@ async fn send_line<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Read a single line from the SMTP client.
+/// Send an SMTP response line, returning from the loop on write error.
+macro_rules! send_or_return {
+    ($reader:expr, $line:expr) => {
+        if let Err(e) = send_line($reader.get_mut(), $line).await {
+            return LoopResult::Done(Err(e.into()));
+        }
+    };
+}
+
+/// Read a single line from the SMTP client with a hard byte limit.
+///
+/// Reads in buffered chunks via `fill_buf()`/`consume()` instead of
+/// byte-by-byte, avoiding per-byte overhead while still enforcing the
+/// size limit.
+///
+/// Returns an error if the line exceeds `max_len` bytes before a newline is
+/// found. This prevents memory exhaustion from newline-less input.
 async fn read_line<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
-    buf: &mut String,
+    buf: &mut Vec<u8>,
+    max_len: usize,
 ) -> Result<Option<String>, std::io::Error> {
     buf.clear();
-    let n = reader.read_line(buf).await?;
-    if n == 0 {
-        return Ok(None);
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            // EOF
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            let s = String::from_utf8_lossy(buf).trim_end().to_string();
+            return Ok(Some(s));
+        }
+
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            // Found newline — take everything before it, consume through the \n
+            buf.extend_from_slice(&available[..pos]);
+            reader.consume(pos + 1);
+            if buf.len() > max_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "line exceeds maximum length",
+                ));
+            }
+            let s = String::from_utf8_lossy(buf).trim_end().to_string();
+            return Ok(Some(s));
+        }
+
+        // No newline in this chunk — consume it all and keep reading
+        let len = available.len();
+        buf.extend_from_slice(available);
+        reader.consume(len);
+        if buf.len() > max_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line exceeds maximum length",
+            ));
+        }
     }
-    if buf.len() > 512 {
-        return Ok(Some(buf[..512].to_string()));
-    }
-    Ok(Some(buf.trim_end().to_string()))
 }
 
 /// Read the DATA portion of an SMTP message until a lone ".".
+///
+/// Passes raw wire format through to the backend — no dot-unstuffing.
+/// The backend (or MDA) is responsible for dot-unstuffing per RFC 5321 §4.5.2.
 async fn read_data<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
-    buf: &mut String,
     max_size: usize,
 ) -> Result<Vec<u8>, std::io::Error> {
     let mut data = Vec::with_capacity(8192);
+    let mut line_buf = Vec::with_capacity(1024);
 
     loop {
-        buf.clear();
-        let n = reader.read_line(buf).await?;
+        line_buf.clear();
+        let n = reader.read_until(b'\n', &mut line_buf).await?;
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -212,16 +270,20 @@ async fn read_data<R: tokio::io::AsyncRead + Unpin>(
             ));
         }
 
-        if buf.trim_end_matches(['\r', '\n']) == "." {
+        // Check for lone "." terminator (with optional \r before \n)
+        let trimmed = if line_buf.ends_with(b"\r\n") {
+            &line_buf[..line_buf.len() - 2]
+        } else if line_buf.ends_with(b"\n") {
+            &line_buf[..line_buf.len() - 1]
+        } else {
+            &line_buf[..]
+        };
+        if trimmed == b"." {
             break;
         }
 
-        // Dot-unstuffing: lines starting with ".." become "."
-        if buf.starts_with("..") {
-            data.extend_from_slice(&buf.as_bytes()[1..]);
-        } else {
-            data.extend_from_slice(buf.as_bytes());
-        }
+        // Relay raw wire format — no dot-unstuffing
+        data.extend_from_slice(&line_buf);
 
         if data.len() > max_size {
             return Err(std::io::Error::new(
@@ -238,163 +300,134 @@ async fn read_data<R: tokio::io::AsyncRead + Unpin>(
 ///
 /// Uses `BufReader<S>` where S implements both AsyncRead and AsyncWrite.
 /// Writes go through `reader.get_mut()` since SMTP is half-duplex.
-#[allow(clippy::too_many_arguments)]
 async fn smtp_loop<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     reader: &mut BufReader<S>,
     state: &mut SessionState,
-    peer_addr: std::net::SocketAddr,
-    config: &Config,
-    lookup: &MailboxLookup,
-    tls_config: &Option<TlsConfig>,
-    metrics: &Metrics,
-    tls_active: bool,
+    ctx: &SmtpContext<'_>,
 ) -> LoopResult {
-    let mut line_buf = String::with_capacity(1024);
+    let mut line_buf = Vec::with_capacity(1024);
 
     loop {
-        let line = match read_line(reader, &mut line_buf).await {
+        let line = match read_line(reader, &mut line_buf, ctx.config.max_line_length).await {
             Ok(Some(line)) => line,
             Ok(None) => return LoopResult::Done(Ok(())),
             Err(e) => {
-                debug!(peer = %peer_addr, error = %e, "read error");
+                debug!(peer = %ctx.peer_addr, error = %e, "read error");
                 return LoopResult::Done(Ok(()));
             }
         };
 
         let (command, args) = parse_command(&line);
 
-        match command {
+        match command.as_str() {
             "EHLO" | "HELO" => {
                 state.ehlo_received = true;
                 let mut caps = vec![
-                    format!("250-{} Hello {}", config.server_name, args),
+                    format!("250-{} Hello {}", ctx.config.server_name, args),
                     "250-SIZE 10485760".to_string(),
                     "250-8BITMIME".to_string(),
                     "250-PIPELINING".to_string(),
                     "250-ENHANCEDSTATUSCODES".to_string(),
                 ];
-                if tls_config.is_some() && !tls_active {
+                if ctx.tls_config.is_some() && !ctx.tls_active {
                     caps.push("250-STARTTLS".to_string());
                 }
                 if let Some(last) = caps.last_mut() {
                     *last = last.replacen("250-", "250 ", 1);
                 }
                 for cap in &caps {
-                    if let Err(e) = send_line(reader.get_mut(), cap).await {
-                        return LoopResult::Done(Err(e.into()));
-                    }
+                    send_or_return!(reader, cap);
                 }
             }
 
             "STARTTLS" => {
-                if tls_active {
-                    if let Err(e) =
-                        send_line(reader.get_mut(), "554 5.5.1 TLS already active").await
-                    {
-                        return LoopResult::Done(Err(e.into()));
-                    }
-                } else if tls_config.is_some() {
-                    if let Err(e) =
-                        send_line(reader.get_mut(), "220 2.0.0 Ready to start TLS").await
-                    {
-                        return LoopResult::Done(Err(e.into()));
-                    }
+                if ctx.tls_active {
+                    send_or_return!(reader, "554 5.5.1 TLS already active");
+                } else if ctx.tls_config.is_some() {
+                    send_or_return!(reader, "220 2.0.0 Ready to start TLS");
                     return LoopResult::StartTls;
-                } else if let Err(e) =
-                    send_line(reader.get_mut(), "502 5.5.1 STARTTLS not available").await
-                {
-                    return LoopResult::Done(Err(e.into()));
+                } else {
+                    send_or_return!(reader, "502 5.5.1 STARTTLS not available");
                 }
             }
 
             "MAIL" => {
                 state.sender = extract_address(args);
                 state.recipients.clear();
-                if let Err(e) = send_line(reader.get_mut(), "250 2.1.0 OK").await {
-                    return LoopResult::Done(Err(e.into()));
-                }
+                send_or_return!(reader, "250 2.1.0 OK");
             }
 
             "RCPT" => {
                 let address = match extract_address(args) {
                     Some(addr) => addr,
                     None => {
-                        if let Err(e) =
-                            send_line(reader.get_mut(), "501 5.1.3 Bad recipient address syntax")
-                                .await
-                        {
-                            return LoopResult::Done(Err(e.into()));
-                        }
+                        send_or_return!(reader, "501 5.1.3 Bad recipient address syntax");
                         continue;
                     }
                 };
 
+                // Enforce per-session RCPT TO limit
+                state.recipient_count += 1;
+                if state.recipient_count > ctx.config.max_recipients {
+                    warn!(
+                        peer = %ctx.peer_addr,
+                        count = state.recipient_count,
+                        max = ctx.config.max_recipients,
+                        "RCPT TO limit exceeded"
+                    );
+                    send_or_return!(reader, "452 4.5.3 Too many recipients");
+                    continue;
+                }
+
                 let address_lower = address.to_lowercase();
                 let domain = address_lower.rsplit('@').next().unwrap_or("");
 
-                if !is_domain_accepted(domain, &config.accepted_domains) {
+                if !is_domain_accepted(domain, &ctx.config.accepted_domains) {
                     info!(
-                        peer = %peer_addr,
+                        peer = %ctx.peer_addr,
                         address = %address_lower,
                         domain = domain,
                         "[MAIL-REJECTED] unknown domain"
                     );
-                    metrics.rejected.fetch_add(1, Ordering::Relaxed);
-                    if let Err(e) = send_line(reader.get_mut(), "550 5.1.2 Unknown domain").await {
-                        return LoopResult::Done(Err(e.into()));
-                    }
+                    ctx.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+                    send_or_return!(reader, "550 5.1.2 Unknown domain");
                     continue;
                 }
 
                 // Check Redis for mailbox existence — the key spam-filtering step
-                if !lookup.should_accept(&address_lower).await {
+                if !ctx.lookup.should_accept(&address_lower).await {
                     info!(
-                        peer = %peer_addr,
+                        peer = %ctx.peer_addr,
                         address = %address_lower,
                         "[MAIL-REJECTED] mailbox not found"
                     );
-                    metrics.rejected.fetch_add(1, Ordering::Relaxed);
-                    if let Err(e) = send_line(reader.get_mut(), "550 5.1.1 User unknown").await {
-                        return LoopResult::Done(Err(e.into()));
-                    }
+                    ctx.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+                    send_or_return!(reader, "550 5.1.1 User unknown");
                     continue;
                 }
 
                 info!(
-                    peer = %peer_addr,
+                    peer = %ctx.peer_addr,
                     address = %address_lower,
                     "[RCPT-ACCEPTED] mailbox verified"
                 );
                 state.recipients.insert(address_lower);
-                if let Err(e) = send_line(reader.get_mut(), "250 2.1.5 OK").await {
-                    return LoopResult::Done(Err(e.into()));
-                }
+                send_or_return!(reader, "250 2.1.5 OK");
             }
 
             "DATA" => {
                 if state.recipients.is_empty() {
-                    if let Err(e) =
-                        send_line(reader.get_mut(), "503 5.5.1 No valid recipients").await
-                    {
-                        return LoopResult::Done(Err(e.into()));
-                    }
+                    send_or_return!(reader, "503 5.5.1 No valid recipients");
                     continue;
                 }
 
-                if let Err(e) = send_line(
-                    reader.get_mut(),
-                    "354 Start mail input; end with <CRLF>.<CRLF>",
-                )
-                .await
-                {
-                    return LoopResult::Done(Err(e.into()));
-                }
+                send_or_return!(reader, "354 Start mail input; end with <CRLF>.<CRLF>");
 
-                let data = match read_data(reader, &mut line_buf, config.max_message_size).await {
+                let data = match read_data(reader, ctx.config.max_message_size).await {
                     Ok(data) => data,
                     Err(e) => {
                         let _ = send_line(reader.get_mut(), "552 5.3.4 Message too large").await;
-                        debug!(peer = %peer_addr, error = %e, "data read error");
+                        debug!(peer = %ctx.peer_addr, error = %e, "data read error");
                         continue;
                     }
                 };
@@ -402,39 +435,33 @@ async fn smtp_loop<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                 let sender = state.sender.as_deref().unwrap_or("");
                 let recipients: Vec<String> = state.recipients.iter().cloned().collect();
 
-                match relay::relay_message(&config.backend_addr, sender, &recipients, &data).await {
+                match relay::relay_message(&ctx.config.backend_addr, sender, &recipients, &data)
+                    .await
+                {
                     Ok(()) => {
-                        metrics
+                        ctx.metrics
                             .accepted
                             .fetch_add(recipients.len() as u64, Ordering::Relaxed);
                         info!(
-                            peer = %peer_addr,
+                            peer = %ctx.peer_addr,
                             sender = sender,
                             recipients = ?recipients,
                             size = data.len(),
                             "[MAIL-RELAYED] forwarded to backend"
                         );
-                        if let Err(e) =
-                            send_line(reader.get_mut(), "250 2.0.0 OK message accepted").await
-                        {
-                            return LoopResult::Done(Err(e.into()));
-                        }
+                        send_or_return!(reader, "250 2.0.0 OK message accepted");
                     }
                     Err(e) => {
-                        metrics.relay_errors.fetch_add(1, Ordering::Relaxed);
+                        ctx.metrics.relay_errors.fetch_add(1, Ordering::Relaxed);
                         warn!(
-                            peer = %peer_addr,
+                            peer = %ctx.peer_addr,
                             error = %e,
                             "[RELAY-ERROR] failed to forward to backend"
                         );
-                        if let Err(e) = send_line(
-                            reader.get_mut(),
-                            "451 4.3.0 Temporary relay failure, try again later",
-                        )
-                        .await
-                        {
-                            return LoopResult::Done(Err(e.into()));
-                        }
+                        send_or_return!(
+                            reader,
+                            "451 4.3.0 Temporary relay failure, try again later"
+                        );
                     }
                 }
 
@@ -443,15 +470,11 @@ async fn smtp_loop<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
 
             "RSET" => {
                 state.reset_transaction();
-                if let Err(e) = send_line(reader.get_mut(), "250 2.0.0 OK").await {
-                    return LoopResult::Done(Err(e.into()));
-                }
+                send_or_return!(reader, "250 2.0.0 OK");
             }
 
             "NOOP" => {
-                if let Err(e) = send_line(reader.get_mut(), "250 2.0.0 OK").await {
-                    return LoopResult::Done(Err(e.into()));
-                }
+                send_or_return!(reader, "250 2.0.0 OK");
             }
 
             "QUIT" => {
@@ -460,19 +483,13 @@ async fn smtp_loop<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
             }
 
             "VRFY" => {
-                if let Err(e) = send_line(reader.get_mut(), "252 2.5.2 Cannot verify user").await {
-                    return LoopResult::Done(Err(e.into()));
-                }
+                send_or_return!(reader, "252 2.5.2 Cannot verify user");
             }
 
             "" => {}
 
             _ => {
-                if let Err(e) =
-                    send_line(reader.get_mut(), "502 5.5.2 Command not recognized").await
-                {
-                    return LoopResult::Done(Err(e.into()));
-                }
+                send_or_return!(reader, "502 5.5.2 Command not recognized");
             }
         }
     }
@@ -490,12 +507,25 @@ pub fn is_domain_accepted(domain: &str, accepted: &std::collections::HashSet<Str
 }
 
 /// Parse the first word (command) and the rest (arguments) from an SMTP line.
-/// Commands are returned as-is (callers should match case-insensitively if needed).
-pub fn parse_command(line: &str) -> (&str, &str) {
+/// The command is uppercased for case-insensitive matching per RFC 5321.
+/// Uses a stack-allocated `ArrayString<8>` since SMTP commands are at most 8 bytes.
+pub fn parse_command(line: &str) -> (ArrayString<8>, &str) {
     let trimmed = line.trim();
     match trimmed.find(' ') {
-        Some(pos) => (&trimmed[..pos], trimmed[pos + 1..].trim()),
-        None => (trimmed, ""),
+        Some(pos) => {
+            let mut cmd = ArrayString::<8>::new();
+            for ch in trimmed[..pos].chars().take(8) {
+                let _ = cmd.try_push(ch.to_ascii_uppercase());
+            }
+            (cmd, trimmed[pos + 1..].trim())
+        }
+        None => {
+            let mut cmd = ArrayString::<8>::new();
+            for ch in trimmed.chars().take(8) {
+                let _ = cmd.try_push(ch.to_ascii_uppercase());
+            }
+            (cmd, "")
+        }
     }
 }
 
@@ -507,5 +537,178 @@ pub fn extract_address(args: &str) -> Option<String> {
         Some(args[start + 1..end].to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::BufReader;
+
+    // -- read_line (bounded) --
+
+    #[tokio::test]
+    async fn read_line_normal() {
+        let input = b"EHLO example.com\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let result = read_line(&mut reader, &mut buf, 1024).await.unwrap();
+        assert_eq!(result, Some("EHLO example.com".to_string()));
+    }
+
+    #[tokio::test]
+    async fn read_line_lf_only() {
+        let input = b"QUIT\n";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let result = read_line(&mut reader, &mut buf, 1024).await.unwrap();
+        assert_eq!(result, Some("QUIT".to_string()));
+    }
+
+    #[tokio::test]
+    async fn read_line_eof_empty() {
+        let input = b"";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let result = read_line(&mut reader, &mut buf, 1024).await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn read_line_eof_with_partial_data() {
+        let input = b"PARTIAL";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let result = read_line(&mut reader, &mut buf, 1024).await.unwrap();
+        assert_eq!(result, Some("PARTIAL".to_string()));
+    }
+
+    #[tokio::test]
+    async fn read_line_exceeds_limit() {
+        // 10 bytes of 'A' without a newline, limit of 5
+        let input = b"AAAAAAAAAA";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let result = read_line(&mut reader, &mut buf, 5).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_line_exactly_at_limit() {
+        // 5 bytes + newline, limit of 5 — should succeed
+        let input = b"ABCDE\n";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let result = read_line(&mut reader, &mut buf, 5).await.unwrap();
+        assert_eq!(result, Some("ABCDE".to_string()));
+    }
+
+    #[tokio::test]
+    async fn read_line_one_over_limit() {
+        // 6 bytes without newline, limit of 5 — should fail
+        let input = b"ABCDEF\n";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let result = read_line(&mut reader, &mut buf, 5).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_line_multiple_lines() {
+        let input = b"LINE1\r\nLINE2\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+
+        let r1 = read_line(&mut reader, &mut buf, 1024).await.unwrap();
+        assert_eq!(r1, Some("LINE1".to_string()));
+
+        let r2 = read_line(&mut reader, &mut buf, 1024).await.unwrap();
+        assert_eq!(r2, Some("LINE2".to_string()));
+
+        let r3 = read_line(&mut reader, &mut buf, 1024).await.unwrap();
+        assert_eq!(r3, None);
+    }
+
+    // -- read_data (no dot-unstuffing, raw wire format) --
+
+    #[tokio::test]
+    async fn read_data_simple_message() {
+        let input = b"Subject: test\r\n\r\nHello world\r\n.\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let data = read_data(&mut reader, 10_000).await.unwrap();
+        assert_eq!(data, b"Subject: test\r\n\r\nHello world\r\n");
+    }
+
+    #[tokio::test]
+    async fn read_data_preserves_dot_stuffing() {
+        // ".." lines should be passed through raw (no unstuffing)
+        let input = b"..leading dot\r\n.\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let data = read_data(&mut reader, 10_000).await.unwrap();
+        // Raw wire format: the ".." is preserved
+        assert_eq!(data, b"..leading dot\r\n");
+    }
+
+    #[tokio::test]
+    async fn read_data_dot_only_terminates() {
+        let input = b"line1\r\n.\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let data = read_data(&mut reader, 10_000).await.unwrap();
+        assert_eq!(data, b"line1\r\n");
+    }
+
+    #[tokio::test]
+    async fn read_data_dot_lf_terminates() {
+        // Lone "." with just LF (no CR)
+        let input = b"line1\n.\n";
+        let mut reader = BufReader::new(&input[..]);
+        let data = read_data(&mut reader, 10_000).await.unwrap();
+        assert_eq!(data, b"line1\n");
+    }
+
+    #[tokio::test]
+    async fn read_data_exceeds_max_size() {
+        // 100 bytes of data, max_size of 10
+        let mut input = Vec::new();
+        for _ in 0..20 {
+            input.extend_from_slice(b"AAAAA\r\n");
+        }
+        input.extend_from_slice(b".\r\n");
+        let mut reader = BufReader::new(&input[..]);
+        let result = read_data(&mut reader, 10).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_data_eof_before_terminator() {
+        let input = b"line1\r\nline2\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let result = read_data(&mut reader, 10_000).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[tokio::test]
+    async fn read_data_empty_message() {
+        // Just a terminator, no body
+        let input = b".\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let data = read_data(&mut reader, 10_000).await.unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_data_dot_in_middle_of_line_not_terminator() {
+        // A line with "." in it but not alone
+        let input = b".not-a-terminator\r\n.\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let data = read_data(&mut reader, 10_000).await.unwrap();
+        // ".not-a-terminator" is not a lone ".", so it's included in data
+        assert_eq!(data, b".not-a-terminator\r\n");
     }
 }

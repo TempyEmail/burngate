@@ -3,11 +3,13 @@ use std::sync::Arc;
 
 use redis::Client;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use burngate::config::Config;
 use burngate::lookup::MailboxLookup;
+use burngate::ratelimit::IpRateLimiter;
 use burngate::session::Metrics;
 use burngate::tls::TlsConfig;
 
@@ -64,6 +66,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(config);
     let metrics = Arc::new(Metrics::new());
 
+    // Connection semaphore (0 = unlimited, use a very large value)
+    let semaphore = Arc::new(Semaphore::new(if config.max_connections > 0 {
+        config.max_connections
+    } else {
+        Semaphore::MAX_PERMITS
+    }));
+
+    // Per-IP rate limiter (None if disabled)
+    let rate_limiter = if config.max_connections_per_ip > 0 {
+        Some(Arc::new(IpRateLimiter::new(config.max_connections_per_ip)))
+    } else {
+        None
+    };
+
     // Spawn metrics reporter (disabled when METRICS_INTERVAL=0)
     if config.metrics_interval_secs > 0 {
         let metrics_clone = metrics.clone();
@@ -86,7 +102,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bind and accept connections
     let listener = TcpListener::bind(config.listen_addr).await?;
-    info!(addr = %config.listen_addr, "listening for SMTP connections");
+    info!(
+        addr = %config.listen_addr,
+        max_connections = config.max_connections,
+        max_connections_per_ip = config.max_connections_per_ip,
+        "listening for SMTP connections"
+    );
 
     loop {
         let (stream, peer_addr) = match listener.accept().await {
@@ -94,6 +115,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 error!(error = %e, "accept error");
                 continue;
+            }
+        };
+
+        // Per-IP rate limiting
+        if let Some(ref limiter) = rate_limiter {
+            if !limiter.check_and_increment(peer_addr.ip()).await {
+                warn!(peer = %peer_addr, "per-IP rate limit exceeded, rejecting");
+                // Send 421 and close — best-effort, ignore errors
+                use tokio::io::AsyncWriteExt;
+                let mut stream = stream;
+                let _ = stream
+                    .write_all(b"421 4.7.0 Too many connections from your IP\r\n")
+                    .await;
+                let _ = stream.shutdown().await;
+                continue;
+            }
+        }
+
+        // Acquire connection semaphore permit
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                error!("connection semaphore closed");
+                break;
             }
         };
 
@@ -107,6 +152,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stream, peer_addr, config, lookup, tls_config, metrics,
             )
             .await;
+            // Permit is dropped here, releasing the semaphore slot
+            drop(permit);
         });
     }
+
+    Ok(())
 }
