@@ -53,6 +53,20 @@ fn parse_command_multiple_spaces() {
     assert_eq!(args, "mail.example.com");
 }
 
+#[test]
+fn parse_command_case_insensitive() {
+    let (cmd, args) = parse_command("ehlo mail.example.com");
+    assert_eq!(cmd, "EHLO");
+    assert_eq!(args, "mail.example.com");
+}
+
+#[test]
+fn parse_command_mixed_case() {
+    let (cmd, args) = parse_command("Rcpt TO:<user@example.com>");
+    assert_eq!(cmd, "RCPT");
+    assert_eq!(args, "TO:<user@example.com>");
+}
+
 // -- extract_address --
 
 #[test]

@@ -33,6 +33,14 @@ pub struct Config {
     pub redis_check_mode: CheckMode,
     /// Metrics reporting interval in seconds. Set to 0 to disable.
     pub metrics_interval_secs: u64,
+    /// Maximum concurrent connections. 0 = unlimited.
+    pub max_connections: usize,
+    /// Maximum RCPT TO recipients per session.
+    pub max_recipients: usize,
+    /// Maximum line length in bytes for SMTP command reads.
+    pub max_line_length: usize,
+    /// Maximum connections per IP address per sliding window. 0 = disabled.
+    pub max_connections_per_ip: u32,
 }
 
 /// Which Redis checks to perform for mailbox existence.
@@ -120,6 +128,26 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(60);
 
+        let max_connections = env::var("MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000);
+
+        let max_recipients = env::var("MAX_RECIPIENTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+
+        let max_line_length = env::var("MAX_LINE_LENGTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+
+        let max_connections_per_ip = env::var("MAX_CONNECTIONS_PER_IP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0); // disabled by default
+
         Config {
             listen_addr,
             backend_addr,
@@ -134,6 +162,10 @@ impl Config {
             redis_set_name,
             redis_check_mode,
             metrics_interval_secs,
+            max_connections,
+            max_recipients,
+            max_line_length,
+            max_connections_per_ip,
         }
     }
 

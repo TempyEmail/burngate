@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -40,6 +40,8 @@ struct SessionState {
     sender: Option<String>,
     recipients: HashSet<String>,
     ehlo_received: bool,
+    /// Running count of RCPT TO commands in this session (not reset per transaction).
+    recipient_count: usize,
 }
 
 impl SessionState {
@@ -48,6 +50,7 @@ impl SessionState {
             sender: None,
             recipients: HashSet::new(),
             ehlo_received: false,
+            recipient_count: 0,
         }
     }
 
@@ -178,33 +181,57 @@ async fn send_line<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Read a single line from the SMTP client.
+/// Read a single line from the SMTP client with a hard byte limit.
+///
+/// Returns an error if the line exceeds `max_len` bytes before a newline is
+/// found. This prevents memory exhaustion from newline-less input.
 async fn read_line<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
-    buf: &mut String,
+    buf: &mut Vec<u8>,
+    max_len: usize,
 ) -> Result<Option<String>, std::io::Error> {
     buf.clear();
-    let n = reader.read_line(buf).await?;
-    if n == 0 {
-        return Ok(None);
+    loop {
+        let byte = match reader.read_u8().await {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                if buf.is_empty() {
+                    return Ok(None);
+                }
+                // Return what we have
+                let s = String::from_utf8_lossy(buf).trim_end().to_string();
+                return Ok(Some(s));
+            }
+            Err(e) => return Err(e),
+        };
+        if byte == b'\n' {
+            let s = String::from_utf8_lossy(buf).trim_end().to_string();
+            return Ok(Some(s));
+        }
+        buf.push(byte);
+        if buf.len() > max_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line exceeds maximum length",
+            ));
+        }
     }
-    if buf.len() > 512 {
-        return Ok(Some(buf[..512].to_string()));
-    }
-    Ok(Some(buf.trim_end().to_string()))
 }
 
 /// Read the DATA portion of an SMTP message until a lone ".".
+///
+/// Passes raw wire format through to the backend — no dot-unstuffing.
+/// The backend (or MDA) is responsible for dot-unstuffing per RFC 5321 §4.5.2.
 async fn read_data<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
-    buf: &mut String,
     max_size: usize,
 ) -> Result<Vec<u8>, std::io::Error> {
     let mut data = Vec::with_capacity(8192);
+    let mut line_buf = Vec::with_capacity(1024);
 
     loop {
-        buf.clear();
-        let n = reader.read_line(buf).await?;
+        line_buf.clear();
+        let n = reader.read_until(b'\n', &mut line_buf).await?;
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -212,16 +239,20 @@ async fn read_data<R: tokio::io::AsyncRead + Unpin>(
             ));
         }
 
-        if buf.trim_end_matches(['\r', '\n']) == "." {
+        // Check for lone "." terminator (with optional \r before \n)
+        let trimmed = if line_buf.ends_with(b"\r\n") {
+            &line_buf[..line_buf.len() - 2]
+        } else if line_buf.ends_with(b"\n") {
+            &line_buf[..line_buf.len() - 1]
+        } else {
+            &line_buf[..]
+        };
+        if trimmed == b"." {
             break;
         }
 
-        // Dot-unstuffing: lines starting with ".." become "."
-        if buf.starts_with("..") {
-            data.extend_from_slice(&buf.as_bytes()[1..]);
-        } else {
-            data.extend_from_slice(buf.as_bytes());
-        }
+        // Relay raw wire format — no dot-unstuffing
+        data.extend_from_slice(&line_buf);
 
         if data.len() > max_size {
             return Err(std::io::Error::new(
@@ -249,10 +280,10 @@ async fn smtp_loop<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     metrics: &Metrics,
     tls_active: bool,
 ) -> LoopResult {
-    let mut line_buf = String::with_capacity(1024);
+    let mut line_buf = Vec::with_capacity(1024);
 
     loop {
-        let line = match read_line(reader, &mut line_buf).await {
+        let line = match read_line(reader, &mut line_buf, config.max_line_length).await {
             Ok(Some(line)) => line,
             Ok(None) => return LoopResult::Done(Ok(())),
             Err(e) => {
@@ -263,7 +294,7 @@ async fn smtp_loop<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
 
         let (command, args) = parse_command(&line);
 
-        match command {
+        match command.as_str() {
             "EHLO" | "HELO" => {
                 state.ehlo_received = true;
                 let mut caps = vec![
@@ -329,6 +360,23 @@ async fn smtp_loop<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                     }
                 };
 
+                // Enforce per-session RCPT TO limit
+                state.recipient_count += 1;
+                if state.recipient_count > config.max_recipients {
+                    warn!(
+                        peer = %peer_addr,
+                        count = state.recipient_count,
+                        max = config.max_recipients,
+                        "RCPT TO limit exceeded"
+                    );
+                    if let Err(e) =
+                        send_line(reader.get_mut(), "452 4.5.3 Too many recipients").await
+                    {
+                        return LoopResult::Done(Err(e.into()));
+                    }
+                    continue;
+                }
+
                 let address_lower = address.to_lowercase();
                 let domain = address_lower.rsplit('@').next().unwrap_or("");
 
@@ -390,7 +438,7 @@ async fn smtp_loop<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                     return LoopResult::Done(Err(e.into()));
                 }
 
-                let data = match read_data(reader, &mut line_buf, config.max_message_size).await {
+                let data = match read_data(reader, config.max_message_size).await {
                     Ok(data) => data,
                     Err(e) => {
                         let _ = send_line(reader.get_mut(), "552 5.3.4 Message too large").await;
@@ -490,12 +538,15 @@ pub fn is_domain_accepted(domain: &str, accepted: &std::collections::HashSet<Str
 }
 
 /// Parse the first word (command) and the rest (arguments) from an SMTP line.
-/// Commands are returned as-is (callers should match case-insensitively if needed).
-pub fn parse_command(line: &str) -> (&str, &str) {
+/// The command is uppercased for case-insensitive matching per RFC 5321.
+pub fn parse_command(line: &str) -> (String, &str) {
     let trimmed = line.trim();
     match trimmed.find(' ') {
-        Some(pos) => (&trimmed[..pos], trimmed[pos + 1..].trim()),
-        None => (trimmed, ""),
+        Some(pos) => {
+            let cmd = trimmed[..pos].to_ascii_uppercase();
+            (cmd, trimmed[pos + 1..].trim())
+        }
+        None => (trimmed.to_ascii_uppercase(), ""),
     }
 }
 
