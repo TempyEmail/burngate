@@ -1,0 +1,17 @@
+/* TEAM */
+
+Project: Burngate
+Sponsor: tempy.email (https://tempy.email)
+Contact: dev@tempy.email
+Location: EU
+
+/* THANKS */
+
+Built with Rust, tokio, redis-rs, and rustls.
+Sponsored by tempy.email -- free disposable email for everyone.
+
+/* SITE */
+
+Standards: SMTP (RFC 5321), STARTTLS (RFC 3207)
+Language: Rust
+Dependencies: tokio, redis, tokio-rustls, rustls, tracing

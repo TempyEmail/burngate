@@ -1,0 +1,13 @@
+target/
+.git/
+.github/
+*.md
+!README.md
+LICENSE
+humans.txt
+llms.txt
+burngate.service
+logo.svg
+docker-compose.yml
+.dockerignore
+.gitignore

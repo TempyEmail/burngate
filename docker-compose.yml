@@ -1,0 +1,42 @@
+services:
+  burngate:
+    build: .
+    ports:
+      - "25:25"
+    environment:
+      - ACCEPTED_DOMAINS=example.com        # required — your domain(s), comma-separated
+      - SERVER_NAME=mail.example.com
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_KEY_PATTERN=mb:{address}
+      - REDIS_SET_NAME=addresses
+      - REDIS_CHECK_MODE=both
+      - BACKEND_SMTP=backend:2525
+      - RUST_LOG=trace
+      - METRICS_INTERVAL=10
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Replace this with your real mail server in production
+  backend:
+    image: rnwood/smtp4dev:latest
+    expose:
+      - "2525"
+    ports:
+      - "3000:80"
+    environment:
+      - ServerOptions__HostName=backend
+      - ServerOptions__Port=2525
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped

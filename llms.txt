@@ -1,0 +1,47 @@
+# Burngate
+
+> Lightweight SMTP gateway for disposable email routing. Rust + Redis. Sponsored by tempy.email.
+
+## What this project does
+
+Burngate is a spam-filtering SMTP proxy. It sits on port 25 in front of your real mail server and intercepts the SMTP conversation at the RCPT TO stage. It checks Redis to see if the recipient mailbox exists. If it doesn't, it responds with 550 and the sender never transmits the email body. If it does exist, it accepts the DATA and relays the complete message to your backend mail server via SMTP.
+
+## Architecture
+
+Single async Rust binary built on tokio. No external SMTP library -- the SMTP protocol is hand-rolled since only a subset (up to DATA) is needed.
+
+Components:
+- config.rs: Configuration from environment variables
+- session.rs: SMTP protocol state machine (EHLO, MAIL FROM, RCPT TO, DATA, STARTTLS, RSET, QUIT)
+- lookup.rs: Redis mailbox existence checks (two-tier: active key + permanent set)
+- relay.rs: SMTP relay to forward accepted messages to backend
+- tls.rs: STARTTLS support via rustls
+
+## Key technical details
+
+- Redis keys: `mb:{address}` (active, with TTL) and `addresses` set (permanent fallback)
+- All addresses lowercased before lookup
+- Subdomain wildcard support: `sub.domain.com` matches if `domain.com` is in accepted domains
+- STARTTLS via BufReader<TcpStream>.into_inner() for stream upgrade
+- Structured JSON logging with tracing
+- Metrics: accepted/rejected/connections/errors counters logged every 60 seconds
+- Fail-closed: Redis errors result in rejection
+
+## Configuration
+
+Environment variables: LISTEN_ADDR, BACKEND_SMTP, REDIS_URL (or REDIS_HOST + REDIS_PORT + REDIS_USERNAME + REDIS_PASSWORD), ACCEPTED_DOMAINS, SERVER_NAME, MAX_MESSAGE_SIZE, TLS_CERT_PATH, TLS_KEY_PATH, CONNECTION_TIMEOUT, RUST_LOG.
+
+## Build
+
+```
+cargo build --release
+cargo test
+cargo clippy -- -D warnings
+```
+
+## Docker
+
+```
+docker build -t burngate .
+docker run -e REDIS_HOST=redis -e BACKEND_SMTP=backend:2525 -p 25:25 burngate
+```
