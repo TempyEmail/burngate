@@ -81,7 +81,10 @@ src/
 
 ## Documentation
 
-After a successful build and before every commit, review and update `README.md`, `CLAUDE.md`, and `llms.txt` if needed. Keep the OTel configuration table, env var list, and architecture notes current with any new features or config changes.
+After a successful build and before every commit:
+- Run `cargo fmt` — CI enforces formatting, commits with fmt violations will fail
+- Run `cargo clippy -- -D warnings` — CI enforces no warnings
+- Review and update `README.md`, `CLAUDE.md`, and `llms.txt` if needed
 
 ## Testing
 
