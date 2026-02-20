@@ -53,6 +53,7 @@ src/
 - **Generic smtp_loop**: The main loop is generic over any `AsyncRead + AsyncWrite + Unpin` stream. Called twice: once for plain text, once for TLS.
 - **Two-tier Redis check**: First checks `mb:{address}` (active, has TTL), then falls back to `addresses` set (permanent). Fail-closed on Redis errors.
 - **Subdomain wildcard**: `abc.tempy.email` matches if `tempy.email` is in accepted domains.
+- **OpenTelemetry**: Optional OTLP tracing via `OTEL_EXPORTER_OTLP_ENDPOINT`. When set, `smtp.session` and `smtp.relay` spans are emitted. The relay step injects a W3C `traceparent` MIME header into outgoing emails so downstream mail processors can continue the trace. Zero overhead when the env var is unset.
 
 ### Redis key format
 
@@ -77,6 +78,10 @@ src/
 - Max message size defaults to 10MB
 - JSON structured logging via `tracing` + `tracing-subscriber`
 - No panics in production paths -- errors are logged and connections are dropped gracefully
+
+## Documentation
+
+After a successful build and before every commit, review and update `README.md`, `CLAUDE.md`, and `llms.txt` if needed. Keep the OTel configuration table, env var list, and architecture notes current with any new features or config changes.
 
 ## Testing
 

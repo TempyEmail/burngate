@@ -5,6 +5,8 @@ use redis::Client;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use burngate::config::Config;
@@ -15,12 +17,35 @@ use burngate::tls::TlsConfig;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize structured logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .json()
+    // Initialize structured logging, with optional OpenTelemetry OTLP export.
+    // Set OTEL_EXPORTER_OTLP_ENDPOINT to enable (e.g. http://localhost:15901 for Aspire).
+    let otel_layer = if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
+        let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "burngate".into());
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .build()
+            .map_err(|e| format!("failed to build OTLP exporter: {e}"))?;
+        let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_resource(opentelemetry_sdk::Resource::new(vec![
+                opentelemetry::KeyValue::new("service.name", service_name),
+            ]))
+            .build();
+        opentelemetry::global::set_tracer_provider(provider.clone());
+        #[allow(clippy::disallowed_methods)]
+        let tracer = {
+            use opentelemetry::trace::TracerProvider as _;
+            provider.tracer("burngate")
+        };
+        Some(tracing_opentelemetry::layer().with_tracer(tracer))
+    } else {
+        None
+    };
+
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(tracing_subscriber::fmt::layer().json())
+        .with(otel_layer)
         .init();
 
     let config = Config::from_env();
@@ -157,5 +182,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    opentelemetry::global::shutdown_tracer_provider();
     Ok(())
 }

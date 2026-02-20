@@ -72,6 +72,7 @@ struct SmtpContext<'a> {
 }
 
 /// Handle a single SMTP session.
+#[tracing::instrument(skip_all, fields(peer = %peer_addr))]
 pub async fn handle_session(
     stream: tokio::net::TcpStream,
     peer_addr: std::net::SocketAddr,

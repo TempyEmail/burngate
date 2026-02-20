@@ -29,7 +29,11 @@ Components:
 
 ## Configuration
 
-Environment variables: LISTEN_ADDR, BACKEND_SMTP, REDIS_URL (or REDIS_HOST + REDIS_PORT + REDIS_USERNAME + REDIS_PASSWORD), ACCEPTED_DOMAINS, SERVER_NAME, MAX_MESSAGE_SIZE, TLS_CERT_PATH, TLS_KEY_PATH, CONNECTION_TIMEOUT, RUST_LOG.
+Environment variables: LISTEN_ADDR, BACKEND_SMTP, REDIS_URL (or REDIS_HOST + REDIS_PORT + REDIS_USERNAME + REDIS_PASSWORD), ACCEPTED_DOMAINS, SERVER_NAME, MAX_MESSAGE_SIZE, TLS_CERT_PATH, TLS_KEY_PATH, CONNECTION_TIMEOUT, RUST_LOG, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME.
+
+## Observability
+
+Optional OpenTelemetry tracing via OTLP. Set OTEL_EXPORTER_OTLP_ENDPOINT (e.g. http://localhost:4317 or the Aspire dashboard endpoint http://localhost:15901) to enable. Each SMTP session produces a root span (smtp.session) and the relay step produces a child span (smtp.relay). A W3C traceparent header is injected into the outgoing email MIME headers so downstream mail processors can attach their spans to the same trace. OTEL_SERVICE_NAME defaults to "burngate". When the env var is unset, OTel is fully disabled with zero runtime overhead.
 
 ## Build
 

@@ -17,6 +17,7 @@ async fn read_response(
 ///
 /// Performs a full SMTP transaction: connect, EHLO, MAIL FROM, RCPT TO (for each
 /// recipient), DATA, message body, QUIT.
+#[tracing::instrument(skip(message_data), fields(size = message_data.len()))]
 pub async fn relay_message(
     backend_addr: &str,
     sender: &str,
@@ -87,6 +88,24 @@ pub async fn relay_message(
             "DATA not accepted: {}",
             resp.trim()
         )));
+    }
+
+    // Inject W3C traceparent header so Ratatoskr can continue this trace.
+    // No-op when OTel is not configured (carrier stays empty, nothing is written).
+    {
+        use opentelemetry::propagation::TextMapPropagator;
+        let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
+        let mut carrier = std::collections::HashMap::<String, String>::new();
+        propagator.inject_context(
+            &tracing_opentelemetry::OpenTelemetrySpanExt::context(&tracing::Span::current()),
+            &mut carrier,
+        );
+        if let Some(tp) = carrier.get("traceparent") {
+            writer.write_all(format!("traceparent: {}\r\n", tp).as_bytes()).await?;
+            if let Some(ts) = carrier.get("tracestate").filter(|s| !s.is_empty()) {
+                writer.write_all(format!("tracestate: {}\r\n", ts).as_bytes()).await?;
+            }
+        }
     }
 
     // Send message body

@@ -192,6 +192,15 @@ All configuration is via environment variables.
 |---|---|---|
 | `RUST_LOG` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 
+### Observability (OpenTelemetry)
+
+| Variable | Default | Description |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | -- | OTLP gRPC endpoint. When set, traces are exported via OTLP. Example: `http://localhost:4317`. Unset = OTel disabled, zero overhead |
+| `OTEL_SERVICE_NAME` | `burngate` | Service name reported in traces |
+
+When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, every SMTP session becomes a root span (`smtp.session`) with each relay as a child span (`smtp.relay`). A W3C `traceparent` header is injected into the outgoing email so downstream services can continue the trace.
+
 ## Redis key format
 
 The gateway checks Redis for each recipient address (lowercased). The check behavior depends on `REDIS_CHECK_MODE`:
@@ -280,6 +289,44 @@ The service runs as a dedicated `burngate` user with `CAP_NET_BIND_SERVICE` to b
 
 Your existing SMTP server should move to an internal port (e.g., `2525`) and bind only to `127.0.0.1`. The gateway handles all external connections on port 25 and relays accepted mail to your backend.
 
+## Distributed tracing (OpenTelemetry)
+
+Burngate supports [OpenTelemetry](https://opentelemetry.io/) traces via OTLP. When enabled, each inbound SMTP connection produces a root span and the relay step produces a child span. A W3C `traceparent` header is injected into every relayed email so the receiving mail server can attach its own processing spans to the same trace.
+
+```
+smtp.session (peer=1.2.3.4:51234)
+  └── smtp.relay (sender=..., recipients=[...], size=1234)
+       [traceparent injected into email headers]
+            ↓
+       Downstream mail server reads traceparent → continues trace
+```
+
+### Setup with .NET Aspire
+
+Point burngate at the Aspire dashboard OTLP endpoint:
+
+```yaml
+environment:
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:15901
+  OTEL_SERVICE_NAME: burngate
+```
+
+Traces appear in the Aspire dashboard alongside your .NET services. To stitch traces end-to-end (burngate → your mail processor → downstream APIs), extract the `traceparent` MIME header from the received message and pass it as the parent context when starting your processing activity.
+
+### Setup with any OTLP backend
+
+```yaml
+environment:
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  OTEL_SERVICE_NAME: burngate
+```
+
+Compatible with Jaeger, Grafana Tempo, Honeycomb, Datadog, and any OTLP-compatible backend.
+
+### Disabling OTel
+
+Do not set `OTEL_EXPORTER_OTLP_ENDPOINT`. The OTel layer is not initialized and there is no runtime overhead.
+
 ## Monitoring
 
 The gateway logs metrics every 60 seconds in structured JSON:
@@ -355,6 +402,8 @@ Burngate is designed to complement these tools, not replace them. You can run it
 ## Sponsor
 
 This project is sponsored by ![tempy.email](https://tempy.email/favicon-32x32.png) [tempy.email](https://tempy.email) -- a free, privacy-first disposable email service. Built to handle millions of inbound emails, the gateway was born out of the need to efficiently filter spam before it reaches the application layer.
+
+Learn more at [tempy.email/burngate](https://tempy.email/burngate).
 
 ## License
 
