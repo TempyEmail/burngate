@@ -101,9 +101,13 @@ pub async fn relay_message(
             &mut carrier,
         );
         if let Some(tp) = carrier.get("traceparent") {
-            writer.write_all(format!("traceparent: {}\r\n", tp).as_bytes()).await?;
+            writer
+                .write_all(format!("traceparent: {}\r\n", tp).as_bytes())
+                .await?;
             if let Some(ts) = carrier.get("tracestate").filter(|s| !s.is_empty()) {
-                writer.write_all(format!("tracestate: {}\r\n", ts).as_bytes()).await?;
+                writer
+                    .write_all(format!("tracestate: {}\r\n", ts).as_bytes())
+                    .await?;
             }
         }
     }
