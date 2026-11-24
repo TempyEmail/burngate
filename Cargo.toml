@@ -2,7 +2,7 @@
 name = "burngate"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Lightweight SMTP gateway for disposable email routing — rejects mail for nonexistent recipients at RCPT TO, before the message body is ever transmitted"
 license = "MIT"
 repository = "https://github.com/TempyEmail/burngate"
@@ -13,18 +13,18 @@ readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.8", default-features = false, features = ["tokio-comp", "connection-manager"] }
 tokio-rustls = "0.26"
 rustls = "0.23"
-rustls-pemfile = "2"
+rustls-pki-types = "1.16"
 thiserror = "2"
 arrayvec = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-opentelemetry = "0.28"
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["tonic"] }
+tracing-opentelemetry = "0.34"
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic", "trace"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt"] }

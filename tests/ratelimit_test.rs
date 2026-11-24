@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use burngate::ratelimit::IpRateLimiter;
+use burngate::ratelimit::{client_key, IpConcurrencyLimiter, IpRateLimiter};
 
 #[tokio::test]
 async fn allows_up_to_limit() {
@@ -80,4 +80,39 @@ async fn many_ips_tracked_independently() {
             "second request from 10.0.0.{i} should be rejected"
         );
     }
+}
+
+#[tokio::test]
+async fn ipv6_grouped_by_64() {
+    let limiter = IpRateLimiter::new(1);
+    let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+    let b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+    let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+    assert!(limiter.check_and_increment(a).await);
+    // Same /64: shares the budget
+    assert!(!limiter.check_and_increment(b).await);
+    // Different /64: independent
+    assert!(limiter.check_and_increment(other).await);
+}
+
+#[test]
+fn ipv4_mapped_ipv6_treated_as_ipv4() {
+    let mapped: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+    assert_eq!(client_key(mapped), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+}
+
+#[test]
+fn concurrency_limit_releases_on_drop() {
+    let limiter = IpConcurrencyLimiter::new(2);
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let g1 = limiter.try_acquire(ip).expect("first");
+    let _g2 = limiter.try_acquire(ip).expect("second");
+    assert!(limiter.try_acquire(ip).is_none());
+    // Other IPs are unaffected
+    assert!(limiter
+        .try_acquire(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
+        .is_some());
+    drop(g1);
+    assert_eq!(limiter.current(ip), 1);
+    assert!(limiter.try_acquire(ip).is_some());
 }

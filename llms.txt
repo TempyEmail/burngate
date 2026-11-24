@@ -15,21 +15,26 @@ Components:
 - session.rs: SMTP protocol state machine (EHLO, MAIL FROM, RCPT TO, DATA, STARTTLS, RSET, QUIT)
 - lookup.rs: Redis mailbox existence checks (two-tier: active key + permanent set)
 - relay.rs: SMTP relay to forward accepted messages to backend
-- tls.rs: STARTTLS support via rustls
+- ratelimit.rs: per-IP connection rate and concurrency limits (IPv6 grouped by /64)
+- tls.rs: STARTTLS support via rustls, with hot reload
 
 ## Key technical details
 
 - Redis keys: `mb:{address}` (active, with TTL) and `addresses` set (permanent fallback)
 - All addresses lowercased before lookup
-- Subdomain wildcard support: `sub.domain.com` matches if `domain.com` is in accepted domains
+- Subdomain wildcard support at any depth: `a.b.domain.com` matches if `domain.com` is in accepted domains
 - STARTTLS via BufReader<TcpStream>.into_inner() for stream upgrade
 - Structured JSON logging with tracing
-- Metrics: accepted/rejected/connections/errors counters logged every 60 seconds
-- Fail-closed: Redis errors result in rejection
+- Metrics: accepted/rejected/deferred/connections/relay_errors counters logged every 60 seconds
+- Fail-closed: Redis errors never accept mail; they return 451 (temporary) so senders retry
+- DATA is dot-unstuffed and line endings normalized on receipt, then re-stuffed on relay (no SMTP smuggling); bare CR is rejected
+- A Received: header with the real client IP is added to every relayed message
+- TLS certificate reloads on SIGHUP and every TLS_RELOAD_INTERVAL seconds
+- Graceful shutdown on SIGTERM: stop accepting, drain sessions for SHUTDOWN_TIMEOUT seconds
 
 ## Configuration
 
-Environment variables: LISTEN_ADDR, BACKEND_SMTP, REDIS_URL (or REDIS_HOST + REDIS_PORT + REDIS_USERNAME + REDIS_PASSWORD), ACCEPTED_DOMAINS, SERVER_NAME, MAX_MESSAGE_SIZE, TLS_CERT_PATH, TLS_KEY_PATH, CONNECTION_TIMEOUT, RUST_LOG, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME.
+Environment variables: LISTEN_ADDR, BACKEND_SMTP, REDIS_URL (or REDIS_HOST + REDIS_PORT + REDIS_USERNAME + REDIS_PASSWORD), ACCEPTED_DOMAINS, SERVER_NAME, MAX_MESSAGE_SIZE, TLS_CERT_PATH, TLS_KEY_PATH, TLS_RELOAD_INTERVAL, CONNECTION_TIMEOUT, IDLE_TIMEOUT, RELAY_TIMEOUT, SHUTDOWN_TIMEOUT, MAX_CONNECTIONS, MAX_CONCURRENT_PER_IP, MAX_CONNECTIONS_PER_IP, MAX_RECIPIENTS, MAX_LINE_LENGTH, REDIS_CHECK_MODE, REDIS_KEY_PATTERN, REDIS_SET_NAME, REDIS_TIMEOUT_MS, METRICS_INTERVAL, RUST_LOG, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME.
 
 ## Observability
 
@@ -40,7 +45,7 @@ Optional OpenTelemetry tracing via OTLP. Set OTEL_EXPORTER_OTLP_ENDPOINT (e.g. h
 ```
 cargo build --release
 cargo test
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 ```
 
 ## Docker

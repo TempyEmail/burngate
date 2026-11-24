@@ -15,7 +15,7 @@ cargo build --release
 cargo test
 
 # Run clippy
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 
 # Format
 cargo fmt
@@ -42,8 +42,10 @@ src/
   config.rs    - Config struct loaded from environment variables
   session.rs   - SMTP state machine (EHLO, MAIL FROM, RCPT TO, DATA, STARTTLS, etc.)
   lookup.rs    - Redis mailbox existence checks (mb:{addr} key + addresses set)
-  relay.rs     - SMTP relay to backend server
-  tls.rs       - STARTTLS support via rustls
+  relay.rs     - SMTP relay to backend server (dot-stuffing, multi-line replies)
+  ratelimit.rs - Per-IP rate + concurrency limits (IPv6 grouped by /64)
+  tls.rs       - STARTTLS support via rustls, hot-reloadable certificate
+  session/tests.rs - End-to-end session tests (fake lookup + fake backend over duplex streams)
 ```
 
 ### Key design decisions
@@ -51,8 +53,12 @@ src/
 - **Hand-rolled SMTP protocol**: No external SMTP crate. The protocol up to DATA is simple (~15 commands). Avoids dependency bloat.
 - **BufReader<TcpStream> for STARTTLS**: Reads through buffered reader, writes via `get_mut()`. SMTP is half-duplex so no concurrent read/write needed. On STARTTLS, `into_inner()` recovers the raw stream for TLS handshake.
 - **Generic smtp_loop**: The main loop is generic over any `AsyncRead + AsyncWrite + Unpin` stream. Called twice: once for plain text, once for TLS.
-- **Two-tier Redis check**: First checks `mb:{address}` (active, has TTL), then falls back to `addresses` set (permanent). Fail-closed on Redis errors.
-- **Subdomain wildcard**: `abc.tempy.email` matches if `tempy.email` is in accepted domains.
+- **Two-tier Redis check**: First checks `mb:{address}` (active, has TTL), then falls back to `addresses` set (permanent). Fail-closed on Redis errors, but with `451` (temporary), never `550`, so senders retry.
+- **Lookup trait**: `smtp_loop` is generic over `MailboxCheck`, so tests use an in-memory lookup instead of Redis.
+- **DATA handling**: `read_data` always reads through the terminating `.` (even when rejecting), bounds memory by `MAX_MESSAGE_SIZE` regardless of newlines, dot-unstuffs and normalizes to CRLF; `relay::encode_data` re-stuffs. Bare CR is rejected. This keeps the backend from ever seeing an ambiguous end-of-data (SMTP smuggling).
+- **Received header**: added to every relayed message, carrying the real client IP.
+- **Subdomain wildcard**: `abc.tempy.email` and `a.b.tempy.email` match if `tempy.email` is in accepted domains.
+- **Shutdown**: SIGTERM/Ctrl-C stops accepting and drains sessions for `SHUTDOWN_TIMEOUT`. SIGHUP reloads the TLS cert.
 - **OpenTelemetry**: Optional OTLP tracing via `OTEL_EXPORTER_OTLP_ENDPOINT`. When set, `smtp.session` and `smtp.relay` spans are emitted. The relay step injects a W3C `traceparent` MIME header into outgoing emails so downstream mail processors can continue the trace. Zero overhead when the env var is unset.
 
 ### Redis key format
@@ -65,7 +71,8 @@ src/
 ### Structured logging tags
 
 - `[RCPT-ACCEPTED]` - mailbox verified
-- `[MAIL-REJECTED]` - unknown address or domain
+- `[MAIL-REJECTED]` - unknown address or domain, or bare CR in message
+- `[MAIL-DEFERRED]` - lookup failed (Redis error/timeout), answered `451`
 - `[MAIL-RELAYED]` - forwarded to backend
 - `[RELAY-ERROR]` - backend relay failed
 - `[METRICS]` - periodic counters (every 60s)
@@ -73,8 +80,9 @@ src/
 ## Conventions
 
 - All email addresses are lowercased before Redis lookup
-- SMTP commands are matched case-sensitively (uppercase per RFC 5321)
-- Connection timeout defaults to 300s
+- SMTP commands are matched case-insensitively (uppercased by `parse_command`, per RFC 5321)
+- Command order is enforced: HELO/EHLO before MAIL, MAIL before RCPT/DATA
+- Session timeout defaults to 300s total, idle timeout 60s per read
 - Max message size defaults to 10MB
 - JSON structured logging via `tracing` + `tracing-subscriber`
 - No panics in production paths -- errors are logged and connections are dropped gracefully
@@ -83,7 +91,8 @@ src/
 
 After a successful build and before every commit:
 - Run `cargo fmt` — CI enforces formatting, commits with fmt violations will fail
-- Run `cargo clippy -- -D warnings` — CI enforces no warnings
+- Run `cargo clippy --all-targets -- -D warnings` — CI enforces no warnings
+- CI also runs `cargo audit`; Actions are pinned by SHA and Docker base images by digest (Dependabot bumps both)
 - Review and update `README.md`, `CLAUDE.md`, and `llms.txt` if needed
 
 ## Testing
@@ -94,7 +103,7 @@ cargo clippy         # Lint
 cargo fmt --check    # Formatting
 ```
 
-Unit tests cover: `parse_command`, `extract_address`, `is_domain_accepted`, domain matching edge cases.
+Unit tests cover: `parse_command`, `extract_address`, `is_domain_accepted`, rate/concurrency limiters, bounded `read_line`/`read_data`, dot-stuffing. `src/session/tests.rs` runs full SMTP sessions against a fake backend, including STARTTLS (fixture cert in `tests/fixtures/`) and cert reload.
 
 ## Sponsor
 

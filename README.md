@@ -163,8 +163,21 @@ All configuration is via environment variables.
 | `ACCEPTED_DOMAINS` | **required** | Comma-separated list of accepted domains |
 | `SERVER_NAME` | `burngate` | Hostname used in SMTP banner and EHLO response |
 | `MAX_MESSAGE_SIZE` | `10485760` (10MB) | Maximum message size in bytes |
-| `CONNECTION_TIMEOUT` | `300` | Connection timeout in seconds |
+| `CONNECTION_TIMEOUT` | `300` | Hard cap on a whole session, in seconds |
+| `IDLE_TIMEOUT` | `60` | Longest the client may stay silent (between commands or during DATA) before getting `421` |
+| `RELAY_TIMEOUT` | `120` | Timeout for relaying one message to the backend; on expiry the sender gets `451` |
+| `SHUTDOWN_TIMEOUT` | `30` | On SIGTERM/Ctrl-C, how long to let in-flight sessions finish |
 | `METRICS_INTERVAL` | `60` | Metrics log interval in seconds. Set to `0` to disable |
+
+### Limits
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAX_CONNECTIONS` | `1000` | Maximum simultaneous connections. Beyond this, new clients get `421 4.3.2` and are disconnected. `0` = unlimited |
+| `MAX_CONCURRENT_PER_IP` | `0` (off) | Maximum simultaneous connections per client IP (IPv6: per /64). Recommended in production (e.g. `20`), unless burngate sits behind a proxy or NAT that hides client IPs |
+| `MAX_CONNECTIONS_PER_IP` | `0` (off) | Maximum new connections per client IP (IPv6: per /64) per fixed 60-second window |
+| `MAX_RECIPIENTS` | `100` | Maximum `RCPT TO` commands per session |
+| `MAX_LINE_LENGTH` | `1024` | Maximum command line length in bytes; longer lines get `500 5.5.2 Line too long` |
 
 ### Redis
 
@@ -178,6 +191,9 @@ All configuration is via environment variables.
 | `REDIS_KEY_PATTERN` | `mb:{address}` | Key pattern for mailbox lookup. `{address}` is replaced with the lowercased recipient |
 | `REDIS_SET_NAME` | `addresses` | Redis SET name for fallback check. Set to empty to disable |
 | `REDIS_CHECK_MODE` | `both` | Which checks to run: `key` (EXISTS only), `set` (SISMEMBER only), `both` (key first, then set fallback) |
+| `REDIS_TIMEOUT_MS` | `5000` | Timeout for connecting to Redis and for each command |
+
+If Redis is unreachable or times out, recipients get `451 4.3.0` (temporary failure), so senders retry later instead of bouncing the mail. Nothing is accepted without a successful lookup.
 
 ### TLS
 
@@ -185,6 +201,9 @@ All configuration is via environment variables.
 |---|---|---|
 | `TLS_CERT_PATH` | -- | Path to PEM certificate for STARTTLS |
 | `TLS_KEY_PATH` | -- | Path to PEM private key for STARTTLS |
+| `TLS_RELOAD_INTERVAL` | `3600` | How often (seconds) to re-read the certificate and key from disk. `0` = only on `SIGHUP` |
+
+The certificate is reloaded on `SIGHUP` and on the interval above, so renewed certificates (e.g. Let's Encrypt) are picked up without a restart. If a reload fails, the previous certificate stays in use and an error is logged. If no certificate can be loaded at all, STARTTLS is not advertised until one loads.
 
 ### Logging
 
@@ -337,6 +356,7 @@ The gateway logs metrics every 60 seconds in structured JSON:
   "message": "[METRICS]",
   "accepted": 1523,
   "rejected": 48291,
+  "deferred": 0,
   "connections": 49814,
   "relay_errors": 0
 }
@@ -344,9 +364,10 @@ The gateway logs metrics every 60 seconds in structured JSON:
 
 Key log tags for filtering:
 - `[RCPT-ACCEPTED]` -- mailbox verified, accepting mail
-- `[MAIL-REJECTED]` -- mailbox not found or unknown domain
+- `[MAIL-REJECTED]` -- mailbox not found, unknown domain, or bare CR in message
+- `[MAIL-DEFERRED]` -- mailbox lookup failed (e.g. Redis down); sender told to retry (`451`)
 - `[MAIL-RELAYED]` -- message forwarded to backend
-- `[RELAY-ERROR]` -- backend relay failed
+- `[RELAY-ERROR]` -- backend relay failed or rejected some recipients
 - `[METRICS]` -- periodic counters
 
 ### Watching metrics live

@@ -165,15 +165,13 @@ fn domain_no_tld() {
 }
 
 #[test]
-fn deep_subdomain_no_match() {
-    // Only one level of subdomain matching: a.b.tempy.email should match
-    // because parent is b.tempy.email, but b.tempy.email is not in accepted.
-    // However tempy.email IS accepted, but we only check one level up.
+fn deep_subdomain_match() {
+    // Subdomains match at any depth
     let domains = make_domains(&["tempy.email"]);
-    // a.b.tempy.email -> parent is b.tempy.email -> not in set
-    assert!(!is_domain_accepted("a.b.tempy.email", &domains));
-    // b.tempy.email -> parent is tempy.email -> in set
+    assert!(is_domain_accepted("a.b.tempy.email", &domains));
     assert!(is_domain_accepted("b.tempy.email", &domains));
+    assert!(!is_domain_accepted("a.b.nottempy.email", &domains));
+    assert!(!is_domain_accepted(".", &domains));
 }
 
 #[test]

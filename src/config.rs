@@ -39,8 +39,23 @@ pub struct Config {
     pub max_recipients: usize,
     /// Maximum line length in bytes for SMTP command reads.
     pub max_line_length: usize,
-    /// Maximum connections per IP address per sliding window. 0 = disabled.
+    /// Maximum new connections per IP address (IPv6: per /64) per fixed
+    /// 60-second window. 0 = disabled.
     pub max_connections_per_ip: u32,
+    /// Maximum simultaneous connections per IP address (IPv6: per /64).
+    /// 0 = disabled.
+    pub max_concurrent_per_ip: usize,
+    /// Idle timeout in seconds: the longest the client may stay silent while
+    /// we wait for a command or the next chunk of DATA.
+    pub idle_timeout_secs: u64,
+    /// Timeout in seconds for relaying one message to the backend.
+    pub relay_timeout_secs: u64,
+    /// Timeout in milliseconds for a single Redis command.
+    pub redis_timeout_ms: u64,
+    /// How often (seconds) to reload the TLS certificate from disk. 0 = only on SIGHUP.
+    pub tls_reload_interval_secs: u64,
+    /// How long (seconds) to wait for in-flight sessions on shutdown.
+    pub shutdown_timeout_secs: u64,
 }
 
 /// Which Redis checks to perform for mailbox existence.
@@ -52,6 +67,14 @@ pub enum CheckMode {
     KeyOnly,
     /// Only check the set (SISMEMBER).
     SetOnly,
+}
+
+/// Parse an environment variable, falling back to `default` when unset or invalid.
+fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 impl Config {
@@ -86,26 +109,20 @@ impl Config {
         let accepted_domains: HashSet<String> = env::var("ACCEPTED_DOMAINS")
             .map(|val| {
                 val.split(',')
-                    .map(|s| s.trim().to_lowercase())
+                    .map(|s| s.trim().trim_end_matches('.').to_lowercase())
                     .filter(|s| !s.is_empty())
                     .collect()
             })
             .expect("ACCEPTED_DOMAINS is required (comma-separated list of domains)");
 
-        let max_message_size = env::var("MAX_MESSAGE_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10 * 1024 * 1024); // 10MB
+        let max_message_size = env_or("MAX_MESSAGE_SIZE", 10 * 1024 * 1024);
 
         let tls_cert_path = env::var("TLS_CERT_PATH").ok();
         let tls_key_path = env::var("TLS_KEY_PATH").ok();
 
         let server_name = env::var("SERVER_NAME").unwrap_or_else(|_| "burngate".to_string());
 
-        let connection_timeout_secs = env::var("CONNECTION_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300); // 5 minutes
+        let connection_timeout_secs = env_or("CONNECTION_TIMEOUT", 300);
 
         // Redis key/set configuration
         let redis_key_pattern =
@@ -123,30 +140,21 @@ impl Config {
             _ => CheckMode::Both,
         };
 
-        let metrics_interval_secs = env::var("METRICS_INTERVAL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60);
+        let metrics_interval_secs = env_or("METRICS_INTERVAL", 60);
 
-        let max_connections = env::var("MAX_CONNECTIONS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1000);
+        let max_connections = env_or("MAX_CONNECTIONS", 1000);
 
-        let max_recipients = env::var("MAX_RECIPIENTS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(100);
+        let max_recipients = env_or("MAX_RECIPIENTS", 100);
 
-        let max_line_length = env::var("MAX_LINE_LENGTH")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1024);
+        let max_line_length = env_or("MAX_LINE_LENGTH", 1024);
 
-        let max_connections_per_ip = env::var("MAX_CONNECTIONS_PER_IP")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0); // disabled by default
+        let max_connections_per_ip = env_or("MAX_CONNECTIONS_PER_IP", 0);
+        let max_concurrent_per_ip = env_or("MAX_CONCURRENT_PER_IP", 0);
+        let idle_timeout_secs = env_or("IDLE_TIMEOUT", 60);
+        let relay_timeout_secs = env_or("RELAY_TIMEOUT", 120);
+        let redis_timeout_ms = env_or("REDIS_TIMEOUT_MS", 5000);
+        let tls_reload_interval_secs = env_or("TLS_RELOAD_INTERVAL", 3600);
+        let shutdown_timeout_secs = env_or("SHUTDOWN_TIMEOUT", 30);
 
         Config {
             listen_addr,
@@ -166,13 +174,13 @@ impl Config {
             max_recipients,
             max_line_length,
             max_connections_per_ip,
+            max_concurrent_per_ip,
+            idle_timeout_secs,
+            relay_timeout_secs,
+            redis_timeout_ms,
+            tls_reload_interval_secs,
+            shutdown_timeout_secs,
         }
-    }
-
-    /// Build a Redis key for the given address using the configured pattern.
-    pub fn redis_key_for(&self, address: &str) -> String {
-        self.redis_key_pattern
-            .replace("{address}", &address.to_lowercase())
     }
 
     /// Check if STARTTLS is available (both cert and key configured).
